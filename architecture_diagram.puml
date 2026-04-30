@@ -1,0 +1,296 @@
+@startuml Project_IronLog_File_Change_Event
+
+!theme plain
+skinparam backgroundColor #1a1a2e
+skinparam sequenceArrowColor #e94560
+skinparam sequenceLifeLineBorderColor #0f3460
+skinparam sequenceParticipantBackgroundColor #16213e
+skinparam sequenceParticipantFontColor #e0e0e0
+skinparam sequenceGroupBackgroundColor #1a1a2e
+skinparam noteFontColor #e0e0e0
+skinparam noteBackgroundColor #0f3460
+skinparam noteBorderColor #e94560
+
+title Project IronLog — End-to-End File Change Event Sequence\n(Single Event Trace with Failure Path)
+
+' ===== PARTICIPANTS =====
+
+box "UNTRUSTED_ZONE — Monitored Endpoint" #1a1a2e
+    participant "Filesystem\n(inotify/eBPF)" as FS
+    participant "Edge Agent\n(Go, eBPF)" as Agent
+end box
+
+box "TRUSTED_ENCLAVE — HSM / SGX Boundary" #0d1b2a
+    participant "HSM\n(FIPS 140-2 L3)" as HSM
+    participant "SGX Enclave\n(Intel SGX)" as SGX
+end box
+
+box "STORAGE_ZONE — Off-Chain" #1a1a2e
+    participant "Private IPFS\nCluster (≥3 nodes)" as IPFS
+end box
+
+box "LEDGER_ZONE — Permissioned Blockchain" #0d1b2a
+    participant "Hyperledger Fabric\nPeer (Endorser)" as Peer
+    participant "Smart Contract\n(Chaincode)" as CC
+    participant "Orderer\nService" as Orderer
+end box
+
+box "AI_ZONE — Anomaly Detection" #1a1a2e
+    participant "ML Inference\nEngine (ONNX)" as AI
+end box
+
+box "SIEM_ZONE — Security Operations" #0d1b2a
+    participant "SIEM\n(Kafka → Splunk/Elastic)" as SIEM
+end box
+
+' ===== STARTUP — SELF-ATTESTATION =====
+
+== AGENT STARTUP — SELF-ATTESTATION ==
+
+note over Agent
+  **CRYPTO OP: BLAKE3 self-hash**
+  Agent computes BLAKE3 hash of its
+  own binary at startup.
+  **Threat mitigated:** T1036 (Masquerading),
+  T1554 (Compromise Client Software Binary)
+end note
+
+Agent -> SGX : Request remote attestation\n(binary_hash, platform_evidence)
+note right of SGX
+  **TRUST BOUNDARY CROSSING:**
+  UNTRUSTED_ZONE → TRUSTED_ENCLAVE
+end note
+SGX -> SGX : Verify platform integrity\n+ binary hash against allow-list
+SGX --> Agent : Attestation token (signed, time-limited)
+note over Agent
+  Attestation token cached; re-attested
+  every 15 min or on config change.
+  **Threat mitigated:** Compromised agent binary
+end note
+
+Agent -> Agent : Unseal config from SGX-sealed storage\n(no plaintext credentials on disk)
+
+' ===== MAIN FLOW — FILE CHANGE DETECTED =====
+
+== FILE CHANGE EVENT — HAPPY PATH ==
+
+FS -> Agent : eBPF event: file_modified(\n  path="/var/log/audit/audit.log",\n  pid=4821, uid=0, timestamp_ns)
+note right of FS
+  **TRUST BOUNDARY CROSSING:**
+  Kernel space → User space
+  eBPF preferred over inotify:
+  inotify is bypassable via direct
+  block device writes (T1006).
+  **Threat mitigated:** T1070.002
+  (Clear Linux Audit Logs)
+end note
+
+Agent -> Agent : Rate limiter check\n(token bucket: 1000 events/sec/agent)\nDrop if exceeded → emit metric
+
+note over Agent
+  **CRYPTO OP: BLAKE3 hash (high-throughput)**
+  file_hash = BLAKE3(file_content)
+  BLAKE3 chosen over SHA-256 for
+  throughput: ~3× faster on x86-64.
+  SHA-256 computed in parallel for
+  compliance records requiring FIPS hash.
+  **Threat mitigated:** T1565.001
+  (Stored Data Manipulation)
+end note
+
+Agent -> Agent : Compute SHA-256 hash (parallel)\nsha256_hash = SHA256(file_content)
+
+' --- IPFS PUSH (ENCRYPTED) ---
+
+note over Agent
+  **CRYPTO OP: AES-256-GCM encryption**
+  encrypted_content = AES-256-GCM(
+    key=HSM-derived-DEK,
+    plaintext=file_content,
+    aad=file_path || timestamp
+  )
+  CID alone proves existence, NOT
+  confidentiality — encryption mandatory.
+  **Threat mitigated:** T1530
+  (Data from Cloud Storage Object)
+end note
+
+Agent -> HSM : Request DEK derivation\n(master_key_ref, context=file_path)
+note right of HSM
+  **TRUST BOUNDARY CROSSING:**
+  UNTRUSTED_ZONE → TRUSTED_ENCLAVE
+  **CRYPTO OP: HKDF key derivation**
+end note
+HSM --> Agent : DEK (ephemeral, never persisted)
+
+Agent -> Agent : Encrypt file content with DEK\n(AES-256-GCM, 96-bit nonce)
+
+Agent -> IPFS : PUT encrypted_content
+note right of IPFS
+  **TRUST BOUNDARY CROSSING:**
+  UNTRUSTED_ZONE → STORAGE_ZONE
+  Min replication factor: 3 nodes
+  Pinning SLA: content pinned immediately,
+  garbage collection exempted for
+  compliance window (SOC2 = 7 years)
+end note
+IPFS --> Agent : CID (content-addressed hash)
+
+' --- HSM SIGNING ---
+
+note over Agent
+  Construct payload:
+  {
+    file_path, blake3_hash, sha256_hash,
+    timestamp (RFC3339Nano), ipfs_cid,
+    dek_key_ref (NOT the key itself),
+    agent_id, attestation_token_hash
+  }
+end note
+
+Agent -> HSM : Sign(payload, agent_private_key_ref)
+note right of HSM
+  **TRUST BOUNDARY CROSSING:**
+  UNTRUSTED_ZONE → TRUSTED_ENCLAVE
+  **CRYPTO OP: ECDSA-P384 signature**
+  Private key NEVER leaves HSM.
+  **Threat mitigated:** T1552.004
+  (Private Keys), T1588.004
+  (Digital Certificates)
+end note
+HSM --> Agent : ECDSA-P384 signature
+
+' --- BLOCKCHAIN COMMIT ---
+
+Agent -> Peer : SubmitTransaction(\n  "LogFileChange",\n  signed_payload)
+note right of Peer
+  **TRUST BOUNDARY CROSSING:**
+  UNTRUSTED_ZONE → LEDGER_ZONE
+  mTLS channel, client cert
+  verified against Fabric MSP.
+end note
+
+Peer -> CC : Invoke LogFileChange(signed_payload)
+
+note over CC
+  **ACCESS CONTROL CHECK:**
+  1. Verify agent_id ∈ registered_agents
+  2. Verify attestation_token is valid
+     and not expired
+  3. Verify ECDSA signature against
+     agent's registered public key
+  **CRYPTO OP: ECDSA-P384 verify**
+  **Threat mitigated:** T1078
+  (Valid Accounts — rogue agent)
+end note
+
+CC -> CC : Validate payload schema\n+ check for duplicate CID
+
+CC -> CC : ZKP verification stub\n(VerifyCompliance — see below)
+
+note over CC
+  **CRYPTO OP: zk-SNARK verification**
+  Verify proof π that:
+    blake3_hash ∈ MerkleTree(allowed_hashes)
+  "Compliance state" = Merkle root of
+  authorized file hashes maintained
+  by security policy contract.
+  Using Groth16 (constant-time verify,
+  trusted setup required).
+  **Threat mitigated:** Unauthorized
+  file modification passing validation
+end note
+
+CC --> CC : Emit event:\n  FileChangeRecorded{\n    txId, blockNum, timestamp,\n    agent_id, file_path,\n    severity, compliance_status\n  }
+
+CC --> Peer : Transaction endorsed
+
+Peer -> Orderer : Submit endorsed transaction
+Orderer -> Orderer : Order into block\n(Raft consensus, 3-of-5 orderers)
+note over Orderer
+  **Endorsement policy:**
+  3-of-5 organizations must endorse.
+  **Threat mitigated:** T1195.002
+  (Supply Chain Compromise —
+  rogue single-org node)
+end note
+
+Orderer --> Peer : Block committed (block #N)
+
+' --- AI ANALYSIS ---
+
+Peer -> AI : Block event →\n  FileChangeRecorded event streamed\n  via Kafka topic
+note right of AI
+  **TRUST BOUNDARY CROSSING:**
+  LEDGER_ZONE → AI_ZONE
+  Kafka topic with TLS + SASL auth
+end note
+
+note over AI
+  **Feature vector extraction:**
+  - cadence_delta: time since last
+    change to this file
+  - hour_entropy: Shannon entropy of
+    change-hour distribution
+  - process_lineage: pid → parent chain
+  - user_context: uid, sudo history
+  - file_sensitivity_tier: (1-5 scale)
+
+  **Model: Isolation Forest (baseline)**
+  Export: ONNX format
+  Mode: Online (streaming) inference
+  FP SLA: ≤ 0.1% on known-good patterns
+
+  **Explainability output:**
+  anomaly_score, triggered_features[],
+  confidence_interval
+end note
+
+AI -> AI : Score event against\nIsolation Forest model
+
+' ===== DECISION POINT =====
+
+alt Anomaly Score ≤ Threshold (NORMAL)
+    AI --> SIEM : Forward enriched event\n(anomaly_score=0.12, status=NORMAL)\nvia OpenTelemetry → Kafka
+    note right of SIEM
+      **TRUST BOUNDARY CROSSING:**
+      AI_ZONE → SIEM_ZONE
+      Event indexed for audit trail.
+    end note
+    SIEM -> SIEM : Index event, update dashboard
+
+else #ffcccc Anomaly Score > Threshold (ALERT)
+
+    == FAILURE PATH — AI REJECTS COMMIT ==
+
+    AI -> AI : Generate explainability report:\n  "Triggered features:\n   cadence_delta=4σ deviation,\n   hour_entropy=HIGH (03:17 UTC),\n   process_lineage=ANOMALOUS\n   (cron→bash→curl→tee)"
+
+    AI --> SIEM : ALERT event\n(severity=CRITICAL,\n anomaly_score=0.94,\n triggered_features=[...],\n recommended_action=ISOLATE)
+    note right of SIEM
+      **TRUST BOUNDARY CROSSING:**
+      AI_ZONE → SIEM_ZONE
+      Alert triggers PagerDuty/SOAR
+    end note
+
+    AI -> Peer : SubmitTransaction(\n  "FlagSuspiciousChange",\n  tx_id, anomaly_report)
+    note right of Peer
+      **TRUST BOUNDARY CROSSING:**
+      AI_ZONE → LEDGER_ZONE
+      Blockchain record is IMMUTABLE —
+      the original FileChangeRecorded
+      event remains. A new SuspiciousFlag
+      event is appended referencing it.
+      **Threat mitigated:** T1070
+      (Indicator Removal — attacker
+      cannot delete the audit trail)
+    end note
+
+    Peer -> CC : Invoke FlagSuspiciousChange(\n  original_tx_id,\n  anomaly_score,\n  explanation)
+    CC -> CC : Mark record as UNDER_INVESTIGATION\nEmit SuspiciousChangeDetected event
+    CC --> Peer : Transaction endorsed + committed
+
+    SIEM -> SIEM : Trigger SOAR playbook:\n  1. Isolate endpoint (network quarantine)\n  2. Snapshot agent memory\n  3. Begin forensic collection\n  4. Notify SOC Tier-2
+
+end
+
+@enduml
